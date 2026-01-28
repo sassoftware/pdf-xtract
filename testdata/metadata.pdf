@@ -1,0 +1,75 @@
+%PDF-2.0
+%‚„œ”
+
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>
+endobj
+
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+
+3 0 obj
+<< /Type /Page
+   /Parent 2 0 R
+   /MediaBox [0 0 595 842]
+   /Contents 4 0 R
+   /Resources << /Font << /F1 6 0 R >> >>
+>>
+endobj
+
+4 0 obj
+<< /Length 64 >>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Test PDF for Metadata Extraction) Tj
+ET
+endstream
+endobj
+
+5 0 obj
+<< /Type /Metadata /Subtype /XML /Length 769 >>
+stream
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="UnitTest Metadata Generator 1.0">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+        xmlns:pdf="http://ns.adobe.com/pdf/1.3/"
+        xmlns:dc="http://purl.org/dc/elements/1.1/"
+        xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <pdf:Producer>UnitTest PDF Generator</pdf:Producer>
+      <dc:title>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">Minimal PDF with Metadata</rdf:li>
+        </rdf:Alt>
+      </dc:title>
+      <xmp:CreateDate>2025-10-27T00:00:00Z</xmp:CreateDate>
+      <xmp:ModifyDate>2025-10-27T00:00:00Z</xmp:ModifyDate>
+      <xmp:MetadataDate>2025-10-27T00:00:00Z</xmp:MetadataDate>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+endstream
+endobj
+
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+
+xref
+0 7
+0000000000 65535 f 
+0000000016 00000 n 
+0000000082 00000 n 
+0000000140 00000 n 
+0000000279 00000 n 
+0000000393 00000 n 
+0000001243 00000 n 
+trailer
+<< /Size 7
+   /Root 1 0 R
+>>
+startxref
+1314
+%%EOF
