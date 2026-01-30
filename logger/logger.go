@@ -4,7 +4,7 @@
 package logger
 
 import (
-	"github.com/sassoftware/viya-pdf-xtract/tracer"
+	"github.com/sassoftware/pdf-xtract/tracer"
 )
 
 // LogLevel represents log severity

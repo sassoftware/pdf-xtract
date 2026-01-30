@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 )
 
 // A Page represent a single page in a PDF file.

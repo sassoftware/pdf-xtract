@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 	"golang.org/x/sync/semaphore"
 )
 

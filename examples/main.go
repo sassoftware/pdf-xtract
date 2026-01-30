@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
-	xtract "github.com/sassoftware/viya-pdf-xtract"
-	"github.com/sassoftware/viya-pdf-xtract/logger"
-	"github.com/sassoftware/viya-pdf-xtract/tracer"
+	xtract "github.com/sassoftware/pdf-xtract"
+	"github.com/sassoftware/pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/tracer"
 )
 
 func main() {
@@ -29,7 +29,7 @@ func main() {
 	proc := xtract.NewProcessor(cfg)
 
 	// Example 1: Extract full text (with maxChars)
-	const path = "../testdata/metadata.pdf"
+	const path = "../testdata/pdf_test.pdf"
 
 	text, truncated, err := proc.Extract(ctx, path)
 	if err != nil {

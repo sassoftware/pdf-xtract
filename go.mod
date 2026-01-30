@@ -1,4 +1,4 @@
-module github.com/sassoftware/viya-pdf-xtract
+module github.com/sassoftware/pdf-xtract
 
 go 1.24.1
 

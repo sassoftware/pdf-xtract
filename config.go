@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 )
 
 type ParsingMode string

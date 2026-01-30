@@ -9,7 +9,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 )
 
 // Meta is the unified, metadata model (Info + XMP fields).
