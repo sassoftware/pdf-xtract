@@ -1,4 +1,4 @@
-# viya-pdf-xtract
+# pdf-xtract
 
 ## Overview
 
@@ -14,17 +14,17 @@ Originally forked from [ledongthuc/pdf](https://github.com/ledongthuc/pdf), this
 
 You can install the library using Go modules:
 
-`go get -u github.com/sassoftware/viya-pdf-xtract`
+`go get -u github.com/sassoftware/pdf-xtract`
 
 ### Getting Started
 
 Import the library in your Go code:
 
-`import github.com/sassoftware/viya-pdf-xtract`
+`import github.com/sassoftware/pdf-xtract`
 
 ### Logging & Observability
 
- `import "github.com/sassoftware/viya-pdf-xtract/logger"`
+ `import "github.com/sassoftware/pdf-xtract/logger"`
 
 The refactored library includes a structured logging layer and a lightweight tracer interface to ensure production-grade observability.
 
@@ -33,7 +33,7 @@ The refactored library includes a structured logging layer and a lightweight tra
 
 ### Tracer Integration
 
-`import "github.com/sassoftware/viya-pdf-xtract/tracer"`
+`import "github.com/sassoftware/pdf-xtract/tracer"`
 
 The library includes a lightweight Tracer subsystem that provides fine-grained observability into PDF parsing and extraction operations. It is designed to support debugging and operational monitoring in production environments where PDFs may be large, malformed, or complex.
  - Object-level processing times (fonts, content streams, metadata objects, etc.)
@@ -43,11 +43,11 @@ The library includes a lightweight Tracer subsystem that provides fine-grained o
 
 ### Running
 
-After installing the library, you can either integrate viya-pdf-xtract into your own Go applications or run the provided example programs to get started quickly.
+After installing the library, you can either integrate pdf-xtract into your own Go applications or run the provided example programs to get started quickly.
 
 ```sh
-git clone https://github.com/sassoftware/viya-pdf-xtract.git
-cd viya-pdf-xtract
+git clone https://github.com/sassoftware/pdf-xtract.git
+cd pdf-xtract
 cd examples
 go run main.go
 ```

@@ -9,7 +9,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 )
 
 const noRune = unicode.ReplacementChar

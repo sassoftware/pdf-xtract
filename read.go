@@ -72,7 +72,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sassoftware/viya-pdf-xtract/logger"
+	"github.com/sassoftware/pdf-xtract/logger"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
