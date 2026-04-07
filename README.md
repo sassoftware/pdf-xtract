@@ -7,7 +7,7 @@ Go-based PDF processing library providing high-fidelity text, content, and metad
 Originally forked from [ledongthuc/pdf](https://github.com/ledongthuc/pdf), this library has been extensively refactored to meet enterprise-grade observability, performance, and compliance requirements.  
 
 - Efficient parsing and extraction of plain text, structured content, and document metadata
-- Robust logging and tracing instrumentation for production debugging
+- Robust logging and tracing instrumentation for production debugging.
 - Compatibility with PDF v1.4 to v2.0 standards
 
 ## Installation
