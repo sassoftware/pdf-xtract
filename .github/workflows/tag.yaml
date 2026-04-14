@@ -1,0 +1,46 @@
+---
+name: Tag
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  tag:
+    name: Auto-tag release
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.head_commit.message, 'release')
+    permissions:
+      contents: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install gotagger
+        run: go install github.com/sassoftware/gotagger/cmd/gotagger@latest
+
+      - name: Configure git
+        run: |
+          git config --local user.email "${{ github.event.head_commit.author.email }}"
+          git config --local user.name "${{ github.event.head_commit.author.name }}"
+
+      - name: Calculate version and tag
+        run: |
+          VERSION="$(gotagger)"
+          echo "Calculated version: ${VERSION}"
+
+          if git rev-parse "${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists, skipping."
+          else
+            echo "Creating tag ${VERSION}"
+            git tag "${VERSION}"
+            git push origin "${VERSION}"
+          fi
