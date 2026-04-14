@@ -8,7 +8,7 @@ Originally forked from [ledongthuc/pdf](https://github.com/ledongthuc/pdf), this
 
 - Efficient parsing and extraction of plain text, structured content, and document metadata
 - Robust logging and tracing instrumentation for production debugging
-- Compatibility with PDF v1.4 to v2.0 standards
+- Compatibility with PDF v1.4 to v2.0 standards.
 
 ## Installation
 
