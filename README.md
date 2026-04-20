@@ -6,8 +6,8 @@ Go-based PDF processing library providing high-fidelity text, content, and metad
 
 Originally forked from [ledongthuc/pdf](https://github.com/ledongthuc/pdf), this library has been extensively refactored to meet enterprise-grade observability, performance, and compliance requirements.  
 
-- Efficient parsing and extraction of plain text, structured content, and document metadata
-- Robust logging and tracing instrumentation for production debugging
+- Efficient parsing and extraction of plain text, structured content, and document metadata.
+- Robust logging and tracing instrumentation for production debugging.
 - Compatibility with PDF v1.4 to v2.0 standards.
 
 ## Installation
@@ -29,7 +29,7 @@ Import the library in your Go code:
 The refactored library includes a structured logging layer and a lightweight tracer interface to ensure production-grade observability.
 
 - High-level structured logs added at major functional boundaries.
-- Error logs include contextual information (file, object, and parsing state).
+- Error logs include contextual information (file, object, and parsing state)
 
 ### Tracer Integration
 
@@ -68,6 +68,7 @@ cfg.MaxConcurrentPDFs = 1
 cfg.MaxWorkersPerPDF = 4
 cfg.ParsingMode = xtract.BestEffort
 cfg.MaxTotalChars = 1000
+cfg.MaxMemoryPerPDF = 10 << 20
 
 cfg.Logger = func(level logger.LogLevel, msg string, keyvals ...interface{}) {
 	// no-op logger
@@ -121,22 +122,27 @@ if err != nil {
 
 ```
 
-### CPU and Memory Usage Comparison (Batch vs Streaming)
+### Performance Improvements
 
-| PDF Size (KB) | Batch mode CPU % | Batch mode  Memory % | Streaming mode CPU % | Streaming mode Memory % | PDF Characteristics |
-|---:|---:|---:|---:|---:|---|
-| 1 | 0.491 | 10.0 | 0.657 | 7.15 | 2-page PDF 1.7, multiline text streams per page, Type1 Helvetica, hybrid compressed XRef stream |
-| 2 | 0.880 | 10.3 | 0.811 | 7.18 | Minimal PDF 2.0, single text stream, XMP metadata, hybrid XRef stream with /Prev (incremental update) |
-| 3 | 0.675 | 10.0 | 0.383 | 7.29 | 5-page PDF 1.7, Flate-compressed streams per page, Info dictionary metadata |
-| 4 | 2.290 | 9.97 | 0.373 | 0.73 | 1-page PDF 1.7, multiple streams, multiple fonts, transformations (rotate/scale) |
-| 23 | 0.655 | 8.70 | 0.520 | 7.38 | Excel-to-PDF, tagged structure, /Lang, XMP and Info dictionary |
-| 41 | 0.258 | 10.0 | 0.479 | 6.45 | Layout-heavy PDF (region/box-based content), visual-order extraction required |
-| 121 | 2.190 | 9.69 | 0.612 | 0.849 | PowerPoint-to-PDF, multi-slide pages, absolute positioned layout |
-| 190 | 2.010 | 9.60 | 0.532 | 8.29 | Linearized PDF 1.6, compressed XRef, /Prev incremental updates |
-| 221 | 3.010 | 11.3 | 1.050 | 9.21 | 15-page multilingual (CJK and English), CID fonts, ToUnicode CMaps |
-| 1382 | 3.930 | 12.4 | 4.160 | 11.4 | Large multi-page PDF (83 pages), dense legislative text |
-| 3884 | 2.280 | 14.0 | 1.750 | 11.9 | Mixed text and embedded images, image-heavy pages |
-| 5939 | 100 | 23.0 | 100 | 20.4 | Extremely large PDF (~1000+ pages), CPU saturation during extraction |
+Recent optimizations have improved extraction performance across all PDF sizes:
+
+| PDF Size | Pages | Extraction Time (Before Changes) | Execution Time (After Changes) |
+|---:|---:|---:|---:|
+| 21 KB | 1 | 1.18s | 1.36s |
+| 260 KB | 46 | 6.2s | 1.26s |
+| 350 KB | 70 | 8.7s | 1.39s |
+| 800 KB | 148 | 5.3s | 1.43s |
+| 5 MB | 9 | 41s | 0.30s |
+| 5.9 MB | 1000 | 5 min 12s | 7.5s |
+| 6 MB | 772 | 5 min 18s | 5.36s |
+| 11 MB | 602 | 5 min 25s | 10s | 
+
+### Memory Usage per PDF
+
+The library implements bounded memory allocation to prevent out-of-memory errors on large PDFs:
+
+**Note:** Memory limits can be configured via `MaxMemoryPerPDF`. If the limit is exceeded during parsing, the operation will fail gracefully with a memory limit error.
+
 
 ## Contributing
 Maintainers are accepting patches and contributions to this project.
