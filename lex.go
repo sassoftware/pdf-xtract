@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+
+	"github.com/sassoftware/pdf-xtract/alloc"
 )
 
 // A token is a PDF token in the input stream, one of the following Go types:
@@ -44,6 +46,7 @@ type buffer struct {
 	key         []byte
 	useAES      bool
 	objptr      objptr
+	bounded     *alloc.BoundedAllocator // Always uses bounded allocator
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.

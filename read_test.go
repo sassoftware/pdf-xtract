@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sassoftware/pdf-xtract/alloc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,7 +43,7 @@ func errHas(err error, sub string) bool {
 
 func TestNewReader_EmptyFile(t *testing.T) {
 	var b bytes.Reader // size = 0
-	_, err := NewReader(&b, 0)
+	_, err := NewReaderBounded(&b, 0, 0)
 
 	assert.Truef(t, err != nil, "expected error for empty input, got nil")
 	assert.Truef(t, errHas(err, "empty"), "expected error to contain 'empty', got: %v", err)
@@ -181,10 +182,13 @@ func TestDecodeInt(t *testing.T) {
 }
 
 func TestEnsureLenAndSetIfEmpty(t *testing.T) {
+	bounded := alloc.NewBounded(256 * 1024 * 1024)
+
 	t.Run("ensureLen_grows", func(t *testing.T) {
 		s := make([]int, 2)
 		s[0], s[1] = 1, 2
-		s2 := ensureLen(s, 5)
+		s2, err := ensureLen(s, 5, bounded)
+		require.NoError(t, err)
 		require.GreaterOrEqual(t, cap(s2), 5)
 		assert.Equal(t, 1, s2[0])
 		assert.Equal(t, 2, s2[1])
@@ -193,16 +197,21 @@ func TestEnsureLenAndSetIfEmpty(t *testing.T) {
 
 	t.Run("setIfEmpty_basic", func(t *testing.T) {
 		table := []xref{}
-		setIfEmpty(&table, 3, xref{ptr: objptr{1, 0}})
+		err := setIfEmpty(&table, 3, xref{ptr: objptr{1, 0}}, bounded)
+		require.NoError(t, err)
 		require.GreaterOrEqual(t, len(table), 4)
 		assert.Equal(t, uint32(1), table[3].ptr.id)
 		// setting again should not overwrite
-		setIfEmpty(&table, 3, xref{ptr: objptr{2, 0}})
+		err = setIfEmpty(&table, 3, xref{ptr: objptr{2, 0}}, bounded)
+		require.NoError(t, err)
 		assert.Equal(t, uint32(1), table[3].ptr.id)
 	})
 }
 
 func TestMergeXrefTables(t *testing.T) {
+	r := &Reader{
+		bounded: alloc.NewBounded(512), // 512 bytes limit
+	}
 	// dest smaller than src
 	dest := []xref{
 		{ptr: objptr{}},
@@ -212,7 +221,7 @@ func TestMergeXrefTables(t *testing.T) {
 	src[1] = xref{ptr: objptr{2, 0}, offset: 200}
 	src[2] = xref{ptr: objptr{3, 0}, offset: 300}
 
-	merged := mergeXrefTables(dest, src)
+	merged := r.mergeXrefTables(dest, src)
 	require.Len(t, merged, 3)
 	assert.Equal(t, uint32(1), merged[0].ptr.id)
 	assert.Equal(t, uint32(2), merged[1].ptr.id)
@@ -225,7 +234,7 @@ func TestMergeXrefTables(t *testing.T) {
 	src2 := []xref{
 		{ptr: objptr{1, 1}, offset: 1000}, // different gen
 	}
-	out := mergeXrefTables(dest2, src2)
+	out := r.mergeXrefTables(dest2, src2)
 	assert.Equal(t, uint16(1), out[0].ptr.gen)
 	assert.Equal(t, int64(1000), out[0].offset)
 }
@@ -323,7 +332,7 @@ func TestReadXrefStreamData(t *testing.T) {
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
 
-	r := &Reader{f: ra, end: size}
+	r := &Reader{f: ra, end: size, bounded: alloc.NewBounded(10 * 1024)}
 	table, _, hdr, err := readXref(r, b)
 	if tval, ok := hdr[name("Type")]; ok {
 		if nm, ok := tval.(name); ok && nm == name("XRef") {
@@ -355,7 +364,7 @@ func TestReadXref(t *testing.T) {
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
 
-	r := &Reader{f: ra, end: size}
+	r := &Reader{f: ra, end: size, bounded: alloc.NewBounded(2 * 1024 * 1024)}
 	table, ptr, hdr, err := readXref(r, b)
 	require.NoError(t, err)
 	require.NotNil(t, table)
@@ -376,6 +385,7 @@ func TestParseXrefTableAndTrailer(t *testing.T) {
 
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
+	b.bounded = alloc.NewBounded(10 * 1024 * 1024) // 10MB limit for test
 
 	tok := b.readToken()
 	if kw, ok := tok.(keyword); !ok || kw != "xref" {
@@ -399,6 +409,7 @@ func TestReadXrefTableData(t *testing.T) {
 	require.NoError(t, err)
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
+	b.bounded = alloc.NewBounded(10 * 1024) // 10KB limit for test
 
 	// ensure classic xref present
 	tok := b.readToken()
@@ -425,6 +436,7 @@ func TestResolvePrevXrefTables(t *testing.T) {
 
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
+	b.bounded = alloc.NewBounded(10 * 1024)
 
 	// require classic
 	tok := b.readToken()
@@ -460,7 +472,7 @@ func TestResolvePrevXrefTables_ErrorCases(t *testing.T) {
 		require.Nil(t, table)
 		require.Nil(t, outTrailer)
 	}
-	// Prev is int64 but does NOT point to "xref"
+	// Prev is int64 but does not point to "xref"
 	{
 		// content at offset 0 that does not start with "xref"
 		data := []byte("notxref\n")
@@ -481,6 +493,7 @@ func TestResolvePrevXrefTables_ErrorCases(t *testing.T) {
 		require.Nil(t, outTrailer)
 	}
 }
+
 func TestValidateTrailerSize(t *testing.T) {
 	ra, size, done := openReaderAt(t, "1_hybrid.pdf")
 	defer done()
@@ -489,6 +502,7 @@ func TestValidateTrailerSize(t *testing.T) {
 	require.NoError(t, err)
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
+	b.bounded = alloc.NewBounded(10 * 1024)
 
 	// must be classic xref
 	tok := b.readToken()
@@ -563,12 +577,13 @@ func TestValidateAndRepairXrefEntries(t *testing.T) {
 func TestHandleTrailerXRefStm(t *testing.T) {
 	ra, size, done := openReaderAt(t, "1_hybrid.pdf")
 	defer done()
-	r := &Reader{f: ra, end: size}
+	r := &Reader{f: ra, end: size, bounded: alloc.NewBounded(10 * 1024)}
 
 	start, err := FindStartXref(ra, size)
 	require.NoError(t, err)
 	b := newBuffer(io.NewSectionReader(ra, start, size-start), start)
 	b.allowEOF, b.allowObjptr, b.allowStream = true, true, true
+	b.bounded = r.bounded
 
 	// ensure classic xref present
 	tok := b.readToken()
@@ -606,7 +621,7 @@ func TestMergePrevXrefStreams_PSizeTooLarge(t *testing.T) {
 	fi, err := f.Stat()
 	require.NoError(t, err)
 
-	r := &Reader{f: f, end: fi.Size()}
+	r := &Reader{f: f, end: fi.Size(), bounded: alloc.NewBounded(1024)}
 	cur := stream{hdr: dict{"Prev": int64(0)}}
 
 	out, err := mergePrevXrefStreams(r, cur, make([]xref, 1), 1)
@@ -624,7 +639,7 @@ func TestMergePrevXrefStreams_StreamDataError(t *testing.T) {
 	fi, err := f.Stat()
 	require.NoError(t, err)
 
-	r := &Reader{f: f, end: fi.Size()}
+	r := &Reader{f: f, end: fi.Size(), bounded: alloc.NewBounded(1024)}
 	cur := stream{hdr: dict{"Prev": int64(0)}}
 
 	out, err := mergePrevXrefStreams(r, cur, make([]xref, 1), 1)
@@ -655,7 +670,7 @@ func TestMergePrevXrefStreams(t *testing.T) {
 	require.NoError(t, err)
 
 	table := make([]xref, sizeVal)
-	r := &Reader{f: ra, end: size}
+	r := &Reader{f: ra, end: size, bounded: alloc.NewBounded(10 * 1024 * 1024)}
 	out, err := mergePrevXrefStreams(r, strm, table, sizeVal)
 	if err != nil {
 		t.Logf("mergePrevXrefStreams returned error (acceptable depending on sample): %v", err)
@@ -668,6 +683,7 @@ func TestReadXrefTableData_Malformed(t *testing.T) {
 	bb := bytes.NewReader([]byte("badheader\ntrailer\n<< /Size 1 >>"))
 	sect := io.NewSectionReader(bb, 0, int64(bb.Len()))
 	b := newBuffer(sect, 0)
+	b.bounded = alloc.NewBounded(1024)
 	_, err := readXrefTableData(b, nil)
 	assert.Error(t, err)
 }
@@ -740,7 +756,6 @@ func TestFindLastLine(t *testing.T) {
 		})
 	}
 }
-
 func TestObjfmt(t *testing.T) {
 	// Table of test cases
 	cases := []struct {
@@ -1023,8 +1038,11 @@ func TestDictEncoder_Decode_MappedAndUnmapped(t *testing.T) {
 		"A": '\u03B1',
 		"B": '\u03B2',
 	}
+
+	reader := &Reader{bounded: alloc.NewBounded(1024)}
+
 	e := &dictEncoder{
-		v: Value{data: array{int64(65), name("A"), int64(66), name("B")}},
+		v: Value{data: array{int64(65), name("A"), int64(66), name("B")}, r: reader},
 	}
 	raw := string([]byte{65, 66, 67}) // 'A','B','C'
 	got := e.Decode(raw)
@@ -1038,9 +1056,11 @@ func TestDictEncoder_Decode_NoMappingsAndEmpty(t *testing.T) {
 
 	nameToRune = map[string]rune{}
 
+	reader := &Reader{bounded: alloc.NewBounded(1024)}
+
 	// no mapping entries: should return identical runes
 	e := &dictEncoder{
-		v: Value{data: array{int64(10), name("X")}},
+		v: Value{data: array{int64(10), name("X")}, r: reader},
 	}
 
 	raw := string([]byte{10, 11})
@@ -1051,4 +1071,116 @@ func TestDictEncoder_Decode_NoMappingsAndEmpty(t *testing.T) {
 	// empty input
 	got2 := e.Decode("")
 	assert.Equal(t, "", got2)
+}
+
+func TestEstimateXrefCapacity(t *testing.T) {
+	// Index array: start=0 count=10, start=100 count=50 -> maxID=149, capacity=149+1+(150/20)=157
+	assert.Equal(t, int64(157), estimateXrefCapacity(100, array{int64(0), int64(10), int64(100), int64(50)}))
+
+	// Declared size fallback: 100 * 120/100 = 120
+	assert.Equal(t, int64(120), estimateXrefCapacity(100, array{}))
+
+	// Minimum capacity when declared size <= 0
+	assert.Equal(t, int64(1), estimateXrefCapacity(0, array{}))
+}
+
+func TestReadXrefStreamChunked(t *testing.T) {
+	r := &Reader{bounded: alloc.NewBounded(1024 * 1024)}
+
+	// ---- success (v1 = 0,1,2) ----
+	data := bytes.NewReader([]byte{
+		0, 0, 0, 0,   // free
+		1, 0, 100, 0, // normal
+		2, 0, 50, 2,  // stream
+	})
+	table := make([]xref, 3)
+
+	res, err := readXrefStreamChunked(r, data, array{int64(0), int64(3)}, table, 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Len(t, res, 3)
+
+	// ---- invalid index ----
+	_, err = readXrefStreamChunked(r, bytes.NewReader([]byte{}), array{name("bad"), int64(1)}, nil, 1, 2, 1, 4)
+	assert.Error(t, err)
+
+	// ---- table grow (cap < maxIdx) ----
+	data2 := bytes.NewReader([]byte{1, 0, 10, 0})
+	res, err = readXrefStreamChunked(r, data2, array{int64(0), int64(1)}, make([]xref, 0, 1), 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Len(t, res, 1)
+
+	// ---- skip overwrite ----
+	data3 := bytes.NewReader([]byte{1, 0, 99, 0})
+	table3 := []xref{{ptr: objptr{1, 0}, offset: 999}}
+
+	res, err = readXrefStreamChunked(r, data3, array{int64(0), int64(1)}, table3, 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Equal(t, int64(999), res[0].offset)
+
+	// ---- chunk loop (>1024) ----
+	n := 1100
+	buf := make([]byte, n*4)
+	for i := 0; i < n; i++ {
+		buf[i*4] = 1
+	}
+	res, err = readXrefStreamChunked(r, bytes.NewReader(buf), array{int64(0), int64(n)}, make([]xref, n), 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Len(t, res, n)
+
+	// ---- partial read (EOF path) ----
+	res, err = readXrefStreamChunked(r, bytes.NewReader([]byte{1}), array{int64(0), int64(1)}, make([]xref, 1), 1, 2, 1, 4)
+	require.NoError(t, err)
+
+	// ---- memory failure ----
+	rSmall := &Reader{bounded: alloc.NewBounded(1)}
+	_, err = readXrefStreamChunked(rSmall, bytes.NewReader([]byte{1, 0, 10, 0}), array{int64(0), int64(1)}, make([]xref, 1), 1, 2, 1, 4)
+	assert.Error(t, err)
+
+}
+
+func TestParseXrefEntriesFromBatch(t *testing.T) {
+	r := &Reader{bounded: alloc.NewBounded(1024 * 1024)}
+
+	// ---- success: v1 = 0,1,2 ----
+	batch := []byte{
+		0, 0, 0, 0,   // free
+		1, 0, 100, 1, // normal
+		2, 0, 50, 2,  // stream
+	}
+	table := make([]xref, 3)
+
+	res, err := parseXrefEntriesFromBatch(r, array{int64(0), int64(3)}, table, batch, 1, 2, 1, 4)
+	require.NoError(t, err)
+	require.Len(t, res, 3)
+
+	assert.Equal(t, uint16(65535), res[0].ptr.gen)
+	assert.Equal(t, int64(100), res[1].offset)
+	assert.True(t, res[2].inStream)
+
+	// ---- malformed index ----
+	_, err = parseXrefEntriesFromBatch(r, array{name("bad"), int64(1)}, nil, batch, 1, 2, 1, 4)
+	assert.Error(t, err)
+
+	// ---- table extend (no realloc) ----
+	table2 := make([]xref, 0, 10)
+	res, err = parseXrefEntriesFromBatch(r, array{int64(0), int64(1)}, table2, []byte{1, 0, 10, 0}, 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Len(t, res, 1)
+
+	// ---- table realloc ----
+	table3 := make([]xref, 0, 1)
+	res, err = parseXrefEntriesFromBatch(r, array{int64(0), int64(1)}, table3, []byte{1, 0, 20, 0}, 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Len(t, res, 1)
+
+	// ---- skip existing ----
+	table4 := []xref{{ptr: objptr{1, 0}, offset: 999}}
+	res, err = parseXrefEntriesFromBatch(r, array{int64(0), int64(1)}, table4, []byte{1, 0, 50, 0}, 1, 2, 1, 4)
+	require.NoError(t, err)
+	assert.Equal(t, int64(999), res[0].offset)
+
+	// ---- buffer overflow (break path) ----
+	shortBuf := []byte{1, 0} // smaller than wtotal
+	res, err = parseXrefEntriesFromBatch(r, array{int64(0), int64(1)}, make([]xref, 1), shortBuf, 1, 2, 1, 4)
+	require.NoError(t, err)
 }

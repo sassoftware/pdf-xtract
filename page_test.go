@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/sassoftware/pdf-xtract/alloc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,6 +19,11 @@ func cs(lo, hi string) byteRange { return byteRange{low: lo, high: hi} }
 
 // Generated a cmap that hits all Decode branches.
 func makeFullTestCMap() *cmap {
+	// Create a Reader with bounded allocator for the cmap to use
+	testReader := &Reader{
+		bounded: alloc.NewBounded(256 * 1024 * 1024), // 256 MB limit for tests
+	}
+
 	return &cmap{
 		space: [4][]byteRange{
 			{ // 1-byte
@@ -50,6 +56,7 @@ func makeFullTestCMap() *cmap {
 		bfrange: []bfrange{
 			{lo: "\x05", hi: "\x07", dst: Value{data: "\x00\x44"}}, // start at "D"
 		},
+		v: Value{r: testReader}, // Initialize with Reader that has bounded allocator
 	}
 }
 
@@ -60,6 +67,7 @@ func TestFindNextCodespace(t *testing.T) {
 			{cs("\x30\x31", "\x30\x31")},                 // 2-byte "01"
 			{cs("\xAA\xBB\xCC", "\xAA\xBB\xCC")},         // 3-byte
 			{cs("\xFA\xFB\xFC\xFD", "\xFA\xFB\xFC\xFD")}, // 4-byte
+
 		},
 	}
 
@@ -225,6 +233,9 @@ func TestCmapDecode(t *testing.T) {
 func TestDecode_MissingCodespace(t *testing.T) {
 	// Mapping exists for 0x01 -> "A", but 0x01 is NOT in codespace.
 	// hence, decode should NOT return "A".
+	testReader := &Reader{
+		bounded: alloc.NewBounded(256 * 1024), // 256 MB limit for tests
+	}
 	m := &cmap{
 		space: [4][]byteRange{
 			{cs("\x7E", "\x7E")}, // only '~' allowed; 0x01 excluded
@@ -232,6 +243,7 @@ func TestDecode_MissingCodespace(t *testing.T) {
 		bfchar: []bfchar{
 			{orig: "\x01", repl: "\x00\x41"}, // would map to "A"
 		},
+		v: Value{r: testReader}, // Initialize with Reader that has bounded allocator
 	}
 	got := m.Decode("\x01")
 	assert.False(t, got == "A", "mapping should fail if codespace is missing")
@@ -250,7 +262,10 @@ func TestByteEncoderDecode(t *testing.T) {
 	tbl['H'] = 'H'
 	tbl['i'] = 'i'
 	tbl['!'] = '!'
-	e := &byteEncoder{table: &tbl}
+
+	// Create a Reader with bounded allocator for the encoder
+	testReader := &Reader{bounded: alloc.NewBounded(1024)}
+	e := &byteEncoder{table: &tbl, v: Value{r: testReader}}
 
 	got := e.Decode("Hi!")
 	assert.Equal(t, "Hi!", got)
@@ -329,6 +344,11 @@ func dictVal(kvs map[string]Value) Value {
 	return Value{data: kvs}
 }
 
+// PDF Dictionary with Reader (for tests that need bounded allocator)
+func dictValWithReader(r *Reader, kvs map[string]Value) Value {
+	return Value{r: r, data: kvs}
+}
+
 // PDF Array
 func arrVal(vals ...Value) Value {
 	return Value{data: vals}
@@ -340,20 +360,25 @@ func nullVal() Value {
 }
 
 func TestGetEncoder(t *testing.T) {
+	// Create a test reader with bounded allocator for all encoder tests
+	testReader := &Reader{
+		bounded: alloc.NewBounded(10 * 1024), // 256 MB limit for tests
+	}
+
 	//WinAnsiEncoding → should decode 0x41 → "A"
-	f1 := Font{V: dictVal(map[string]Value{"Encoding": nameVal("WinAnsiEncoding")})}
+	f1 := Font{V: dictValWithReader(testReader, map[string]Value{"Encoding": nameVal("WinAnsiEncoding")})}
 	enc1 := f1.getEncoder()
 	got := enc1.Decode(string([]byte{0x41}))
 	assert.Equal(t, "A", got)
 
 	//MacRomanEncoding → should decode 0x41 → "A"
-	f2 := Font{V: dictVal(map[string]Value{"Encoding": nameVal("MacRomanEncoding")})}
+	f2 := Font{V: dictValWithReader(testReader, map[string]Value{"Encoding": nameVal("MacRomanEncoding")})}
 	enc2 := f2.getEncoder()
 	got = enc2.Decode(string([]byte{0x41}))
 	assert.Equal(t, "A", got)
 
 	// Identity-H with no ToUnicode → falls back to pdfDocEncoding, ASCII passthrough
-	f3 := Font{V: dictVal(map[string]Value{
+	f3 := Font{V: dictValWithReader(testReader, map[string]Value{
 		"Encoding":  nameVal("Identity-H"),
 		"ToUnicode": nullVal(),
 	})}
@@ -363,15 +388,15 @@ func TestGetEncoder(t *testing.T) {
 
 	// Dict with Differences → should produce a dictEncoder that alters mappings
 	diff := arrVal(intVal(65), nameVal("A")) // map code 65 -> /A
-	f4 := Font{V: dictVal(map[string]Value{
-		"Encoding": dictVal(map[string]Value{"Differences": diff}),
+	f4 := Font{V: dictValWithReader(testReader, map[string]Value{
+		"Encoding": dictValWithReader(testReader, map[string]Value{"Differences": diff}),
 	})}
 	enc4 := f4.getEncoder()
 	got = enc4.Decode(string([]byte{65}))
 	require.NotEmpty(t, got)
 
 	// Null encoding → falls back to charmapEncoding/pdfDocEncoding
-	f5 := Font{V: dictVal(map[string]Value{
+	f5 := Font{V: dictValWithReader(testReader, map[string]Value{
 		"Encoding":  nullVal(),
 		"ToUnicode": nullVal(),
 	})}
@@ -380,7 +405,7 @@ func TestGetEncoder(t *testing.T) {
 	assert.Equal(t, "Test", got)
 
 	//Unknown encoding name → nopEncoder (passthrough)
-	f6 := Font{V: dictVal(map[string]Value{"Encoding": nameVal("FooBar")})}
+	f6 := Font{V: dictValWithReader(testReader, map[string]Value{"Encoding": nameVal("FooBar")})}
 	enc6 := f6.getEncoder()
 	got = enc6.Decode("XYZ")
 	assert.Equal(t, "XYZ", got)
@@ -389,7 +414,7 @@ func TestGetEncoder(t *testing.T) {
 func TestPage(t *testing.T) {
 	ra, size, done := openReaderAt(t, "pdf_test.pdf")
 	defer done()
-	r, err := NewReader(ra, size)
+	r, err := NewReaderBounded(ra, size, 10*1024)
 	if err != nil {
 		t.Skipf("Skipping: cannot parse PDF sample: %v", err)
 	}
@@ -428,7 +453,7 @@ func TestGetStyledTexts(t *testing.T) {
 	ra, size, done := openReaderAt(t, "pdf_test.pdf")
 	defer done()
 
-	r, err := NewReader(ra, size)
+	r, err := NewReaderBounded(ra, size, 256*1024)
 	if err != nil {
 		t.Skipf("Skipping: cannot parse PDF sample: %v", err)
 	}
@@ -494,7 +519,7 @@ startxref
 func newTestReader(t *testing.T, b []byte) *Reader {
 	t.Helper()
 	br := bytes.NewReader(b) // bytes.Reader implements io.ReaderAt
-	r, err := NewReader(br, int64(len(b)))
+	r, err := NewReaderBounded(br, int64(len(b)), 64*1024)
 	if err != nil {
 		// print a clear error to help debugging (include %#v to reveal formatting/newlines)
 		t.Fatalf("failed to initialize Reader: %#v", err)
@@ -590,7 +615,7 @@ func TestGetTextByColumn(t *testing.T) {
 	pdf := []byte(b.String())
 
 	br := bytes.NewReader(pdf)
-	r, err := NewReader(br, int64(len(pdf)))
+	r, err := NewReaderBounded(br, int64(len(pdf)), 256*1024)
 	require.NoError(t, err, "NewReader should succeed")
 
 	page := r.Page(1)
@@ -688,7 +713,7 @@ func TestGetTextByRow(t *testing.T) {
 	pdf := []byte(b.String())
 
 	br := bytes.NewReader(pdf)
-	r, err := NewReader(br, int64(len(pdf)))
+	r, err := NewReaderBounded(br, int64(len(pdf)), 100*1024)
 	require.NoError(t, err, "NewReader should succeed")
 
 	page := r.Page(1)
@@ -719,7 +744,7 @@ func TestGetTextByRow(t *testing.T) {
 
 func TestFontWidths(t *testing.T) {
 	br := bytes.NewReader(minimalTwoPagePDF)
-	r, err := NewReader(br, int64(len(minimalTwoPagePDF)))
+	r, err := NewReaderBounded(br, int64(len(minimalTwoPagePDF)), 100*1024)
 	require.NoError(t, err, "NewReader should succeed")
 
 	p := r.Page(1)
@@ -781,7 +806,7 @@ func TestWalkTextBlocks(t *testing.T) {
 
 	pdf := []byte(sb.String())
 	br := bytes.NewReader(pdf)
-	r, err := NewReader(br, int64(len(pdf)))
+	r, err := NewReaderBounded(br, int64(len(pdf)), 100*1024)
 	require.NoError(t, err)
 
 	page := r.Page(1)
@@ -891,7 +916,7 @@ func TestPageContent(t *testing.T) {
 	pdf := []byte(b.String())
 
 	br := bytes.NewReader(pdf)
-	r, err := NewReader(br, int64(len(pdf)))
+	r, err := NewReaderBounded(br, int64(len(pdf)), 256*1024)
 	require.NoError(t, err, "NewReader should succeed")
 
 	page := r.Page(1)
@@ -925,6 +950,11 @@ func TestPageContent(t *testing.T) {
 }
 
 func TestBuildOutline(t *testing.T) {
+	// Create a test reader with bounded allocator
+	testReader := &Reader{
+		bounded: alloc.NewBounded(256 * 1024),
+	}
+
 	root := dict{
 		name("Title"): "Root",
 		name("First"): dict{
@@ -935,7 +965,7 @@ func TestBuildOutline(t *testing.T) {
 		},
 	}
 
-	v := Value{data: root}
+	v := Value{r: testReader, data: root}
 
 	out := buildOutline(v)
 	assert.Equal(t, "Root", out.Title)

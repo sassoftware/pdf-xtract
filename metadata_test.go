@@ -21,8 +21,8 @@ func TestParseXMPWithXML(t *testing.T) {
 	ra, size, done := openReaderAt(t, "metadata.pdf")
 	defer done()
 
-	r, err := NewReader(ra, size)
-	require.NoError(t, err, "NewReaderEncrypted should succeed")
+	r, err := NewReaderBounded(ra, size, 64*1024)
+	require.NoError(t, err, "NewReaderBounded should succeed")
 
 	// Read raw XMP XML from the PDF's /Root/Metadata stream
 	xmpXML, err := r.readXMP()
@@ -82,4 +82,59 @@ func TestHeaderVersion(t *testing.T) {
 	// If no header present, expect empty string
 	r2 := &Reader{f: bytes.NewReader([]byte("no pdf header here"))}
 	assert.Equal(t, "", r2.headerVersion())
+}
+
+func TestContainsNonEmbeddedFont(t *testing.T) {
+	tests := []struct {
+		name     string
+		pdfFile  string
+		expected bool
+	}{
+		{
+			name:     "EmbeddedFontsOnly",
+			pdfFile:  "pdf_test.pdf",
+			expected: false, // All fonts are embedded
+		},
+		{
+			name:     "HasNonEmbeddedFonts",
+			pdfFile:  "ppt_to_pdf.pdf",
+			expected: true, // Contains non-embedded fonts
+		},
+		{
+			name:     "HybridPDF",
+			pdfFile:  "0_hybrid.pdf",
+			expected: true,
+		},
+		{
+			name:     "MinimalMetadataPDF",
+			pdfFile:  "metadata.pdf",
+			expected: true,
+		},
+		{
+			name:     "ExcelConvertedPDF",
+			pdfFile:  "excel_to_pdf_1pg.pdf",
+			expected: false, // Embedded fonts
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ra, size, done := openReaderAt(t, tt.pdfFile)
+			defer done()
+
+			r, err := NewReaderBounded(ra, size, 128*1024)
+			require.NoError(t, err, "NewReaderBounded should succeed")
+
+			result := r.containsNonEmbeddedFont()
+			assert.Equal(t, tt.expected, result, "Result should match expected for %s", tt.pdfFile)
+
+			result2 := r.containsNonEmbeddedFont()
+			assert.Equal(t, result, result2, "Function should be idempotent")
+
+			metadata, err := r.MetadataFull()
+			require.NoError(t, err, "MetadataFull should succeed")
+			assert.Equal(t, result, metadata.ContainsNonEmbeddedFont,
+				"MetadataFull should match direct call result")
+		})
+	}
 }

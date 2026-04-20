@@ -20,6 +20,7 @@ func main() {
 	cfg.MaxWorkersPerPDF = 4
 	cfg.ParsingMode = xtract.BestEffort
 	cfg.MaxTotalChars = 5000
+	cfg.MaxMemoryPerPDF = 10 << 20
 	cfg.Logger = func(level logger.LogLevel, msg string, keyvals ...interface{}) {
 		// no-op logger
 	}

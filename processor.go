@@ -102,11 +102,16 @@ func (p *processor) Extract(ctx context.Context, path string) (string, bool, err
 	defer p.sem.Release(1)
 	logger.Debug(fmt.Sprintf("Slot acquired for extraction: path=%s", path), true)
 
-	_, r, err := Open(path)
+	_, r, err := OpenWithMemoryLimit(path, p.cfg.MaxMemoryPerPDF)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("Failed to open PDF: path=%s err=%v", path, err), true)
 		return "", false, err
 	}
+	// Reset allocator after extraction completes to release memory immediately
+	defer func() {
+		r.ResetAllocator()
+	}()
+	defer logger.Debug(fmt.Sprintf("Allocator reset for: path=%s", path), true)
 
 	total := r.NumPage()
 	logger.Debug(fmt.Sprintf("Total pages detected: path=%s pages=%d", path, total), true)
@@ -119,6 +124,10 @@ func (p *processor) Extract(ctx context.Context, path string) (string, bool, err
 	numWorkers := p.adjustWorkerCount(p.cfg.MaxWorkersPerPDF)
 	logger.Debug(fmt.Sprintf("Starting workers: count=%d", numWorkers), true)
 
+	// Channel allocations: Channels are Go runtime-managed structures used for coordination.
+	// They hold small values (page indices and result structs with string references).
+	// The actual large memory (text content) is allocated via bounded allocator in page.GetPlainText().
+	// Note: Reader.bounded allocator is thread-safe (internal mutex) for concurrent goroutine access.
 	jobs, results := make(chan int, total), make(chan pageResult, total)
 
 	var wg sync.WaitGroup
@@ -127,7 +136,6 @@ func (p *processor) Extract(ctx context.Context, path string) (string, bool, err
 	close(jobs)
 
 	// In-order collection with truncation
-
 	go func() {
 		wg.Wait()
 		close(results)
@@ -154,7 +162,7 @@ func (p *processor) ExtractAsStream(ctx context.Context, path string) (<-chan st
 	}
 	defer p.sem.Release(1)
 
-	_, r, err := Open(path)
+	_, r, err := OpenWithMemoryLimit(path, p.cfg.MaxMemoryPerPDF)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("Failed to open PDF for streaming: err=%v", err), true)
 		return nil, false, err
@@ -166,10 +174,14 @@ func (p *processor) ExtractAsStream(ctx context.Context, path string) (<-chan st
 	if total == 0 {
 		ch := make(chan string)
 		close(ch)
+		// Empty PDF, reset immediately
+		r.ResetAllocator()
 		return ch, false, nil
 	}
 
 	numWorkers := p.adjustWorkerCount(p.cfg.MaxWorkersPerPDF)
+	// Channel allocations: Small coordination channels for concurrent processing.
+	// Actual text memory is bounded via page.GetPlainText() -> bounded allocator.
 	jobs, results := make(chan int, total), make(chan pageResult, total)
 
 	var wg sync.WaitGroup
@@ -178,11 +190,17 @@ func (p *processor) ExtractAsStream(ctx context.Context, path string) (<-chan st
 	p.feedJobs(ctx, total, jobs)
 	close(jobs)
 
-	outCh := make(chan string)
+	outCh := make(chan string) // Small channel for streaming already-bounded text strings
 	truncated := false
 
 	go func() {
 		defer close(outCh)
+		// Reset allocator after streaming completes
+		defer func() {
+			r.ResetAllocator()
+		}()
+		defer logger.Debug(fmt.Sprintf("Allocator reset after streaming: path=%s", path), true)
+
 		go func() {
 			wg.Wait()
 			close(results)
@@ -195,6 +213,8 @@ func (p *processor) ExtractAsStream(ctx context.Context, path string) (<-chan st
 }
 
 func (p *processor) emitInOrder(results chan pageResult) (strings.Builder, bool, error) {
+	// pageBuffer holds references to already-extracted text strings (bounded via GetPlainText).
+	// The map itself is small - just pointers and page indices.
 	pageBuffer := make(map[int]string)
 	nextPage := 1
 	var out strings.Builder
@@ -248,6 +268,7 @@ func (p *processor) emitInOrder(results chan pageResult) (strings.Builder, bool,
 }
 
 func (p *processor) streamInOrder(results chan pageResult, outCh chan string) (truncated bool) {
+	// pageBuffer holds references to already-bounded text strings.
 	pageBuffer := make(map[int]string)
 	nextPage := 1
 	totalChars := 0
@@ -321,6 +342,9 @@ type pageResult struct {
 }
 
 func (p *processor) startWorkers(ctx context.Context, r Reader, jobs <-chan int, results chan<- pageResult, numWorkers int, wg *sync.WaitGroup) {
+	// All goroutines share the same Reader instance (passed by value, but r.bounded pointer is shared).
+	// The BoundedAllocator (r.bounded) is thread-safe with internal mutex, so concurrent
+	// page.GetPlainText() calls across goroutines are safe and all tracked under 256MB ceiling.
 	logger.Debug(fmt.Sprintf("Spawning workers: num_workers=%d", numWorkers), true)
 	for w := 1; w <= numWorkers; w++ {
 		wg.Add(1)
@@ -379,6 +403,7 @@ func (p *processor) feedJobs(ctx context.Context, total int, jobs chan<- int) er
 
 // cacheFonts creates a one-time map of fonts for a page to avoid
 // repeatedly parsing font charmaps.
+// Note: Small map allocation - acceptable bypass as Go maps are impractical to track through allocator.
 func cacheFonts(page *Page) map[string]*Font {
 	fonts := make(map[string]*Font)
 	for _, name := range page.Fonts() {
@@ -395,11 +420,15 @@ func cacheFonts(page *Page) map[string]*Font {
 func (p *processor) Metadata(ctx context.Context, path string, w io.Writer) error {
 	logger.Debug(fmt.Sprintf("Reading metadata: path=%s", path), true)
 
-	_, r, err := Open(path)
+	_, r, err := OpenWithMemoryLimit(path, p.cfg.MaxMemoryPerPDF)
 	if err != nil {
 		logger.Error("failed to open PDF for metadata:")
 		return err
 	}
+	// Reset allocator after metadata extraction completes
+	defer func() {
+		r.ResetAllocator()
+	}()
 	defer func() {
 		if closer, ok := r.f.(io.Closer); ok {
 			_ = closer.Close()

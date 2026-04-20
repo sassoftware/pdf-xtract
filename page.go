@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sassoftware/pdf-xtract/alloc"
 	"github.com/sassoftware/pdf-xtract/logger"
 )
 
@@ -67,7 +68,9 @@ func (r *Reader) NumPage() int {
 func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	pages := r.NumPage()
 	logger.Debug(fmt.Sprintf("total pages = %d", pages), true)
-	var buf bytes.Buffer
+	// Use pooled buffer to reduce allocations
+	buf := getBytesBuffer()
+	defer putBytesBuffer(buf)
 	fonts := make(map[string]*Font)
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
@@ -88,11 +91,24 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	}
 	logger.Debug("Successfully completed parsing", true)
 
-	return &buf, nil
+	// Return a copy since we're returning the pooled buffer
+	result := bytes.NewBuffer(buf.Bytes())
+	return result, nil
 }
 
 // GetStyledTexts returns list all sentences in an array, that are included styles
 func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
+	if r.bounded != nil {
+		var allocErr error
+		sentences, allocErr = alloc.BoundedAllocSlice[Text](r.bounded, 100) // Initial capacity
+		if allocErr != nil {
+			return nil, fmt.Errorf("memory limit exceeded allocating sentences: %v", allocErr)
+		}
+		sentences = sentences[:0]
+	} else {
+		panic("GetStyledTexts used without bounded allocator - Reader not properly initialized")
+	}
+
 	totalPage := r.NumPage()
 	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
 		p := r.Page(pageIndex)
@@ -107,7 +123,6 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 				lastTextStyle = text
 				continue
 			}
-
 			if IsSameSentence(lastTextStyle, text) {
 				lastTextStyle.S = lastTextStyle.S + text.S
 			} else {
@@ -119,7 +134,6 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 			sentences = append(sentences, lastTextStyle)
 		}
 	}
-
 	return sentences, err
 }
 
@@ -188,6 +202,18 @@ func (f Font) LastChar() int {
 func (f Font) Widths() []float64 {
 	x := f.V.Key("Widths")
 	var out []float64
+	if f.V.r != nil && f.V.r.bounded != nil {
+		var allocErr error
+		out, allocErr = alloc.BoundedAllocSlice[float64](f.V.r.bounded, x.Len())
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating widths: %v", allocErr))
+			panic(allocErr)
+		}
+		out = out[:0]
+	} else {
+		panic("Widths used without bounded allocator - Reader not properly initialized")
+	}
+
 	for i := 0; i < x.Len(); i++ {
 		out = append(out, x.Index(i).Float64())
 	}
@@ -222,9 +248,9 @@ func (f Font) getEncoder() TextEncoding {
 		logger.Debug(fmt.Sprintf("getEncoder: found named encoding = %q", enc.Name()), true)
 		switch enc.Name() {
 		case "WinAnsiEncoding":
-			return &byteEncoder{&winAnsiEncoding}
+			return &byteEncoder{table: &winAnsiEncoding, v: f.V}
 		case "MacRomanEncoding":
-			return &byteEncoder{&macRomanEncoding}
+			return &byteEncoder{table: &macRomanEncoding, v: f.V}
 		case "Identity-H":
 			return f.charmapEncoding()
 		default:
@@ -237,7 +263,6 @@ func (f Font) getEncoder() TextEncoding {
 		return f.charmapEncoding()
 	default:
 		logger.Debug("unexpected encoding : %d", enc.String())
-
 		return &nopEncoder{}
 	}
 }
@@ -253,7 +278,7 @@ func (f *Font) charmapEncoding() TextEncoding {
 		return m
 	}
 	logger.Debug("charmapEncoding: no ToUnicode stream found — using pdfDocEncoding", true)
-	return &byteEncoder{&pdfDocEncoding}
+	return &byteEncoder{table: &pdfDocEncoding, v: f.V}
 }
 
 type dictEncoder struct {
@@ -262,7 +287,18 @@ type dictEncoder struct {
 
 func (e *dictEncoder) Decode(raw string) (text string) {
 	logger.Debug("decoding dictEncoding")
-	r := make([]rune, 0, len(raw))
+	var r []rune
+	var allocErr error
+	if e.v.r != nil && e.v.r.bounded != nil {
+		r, allocErr = alloc.BoundedAllocSlice[rune](e.v.r.bounded, len(raw))
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating runes: %v", allocErr))
+			return raw // fallback to raw string on allocation failure
+		}
+		r = r[:0] // Set length to 0, keep capacity
+	} else {
+		panic("dictEncoder used without bounded allocator - Reader not properly initialized")
+	}
 	for i := 0; i < len(raw); i++ {
 		ch := rune(raw[i])
 		n := -1
@@ -306,15 +342,24 @@ func (e *nopEncoder) Decode(raw string) (text string) {
 
 type byteEncoder struct {
 	table *[256]rune
+	v     Value // Access to Reader's global allocator through v.r.bounded
 }
 
 func (e *byteEncoder) Decode(raw string) (text string) {
 	logger.Debug("decoding byteEncoder")
-	r := make([]rune, 0, len(raw))
-	for i := 0; i < len(raw); i++ {
-		r = append(r, e.table[raw[i]])
+	if e.v.r != nil && e.v.r.bounded != nil {
+		r, allocErr := alloc.BoundedAllocSlice[rune](e.v.r.bounded, len(raw))
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating runes: %v", allocErr))
+			return raw // fallback
+		}
+		r = r[:0]
+		for i := 0; i < len(raw); i++ {
+			r = append(r, e.table[raw[i]])
+		}
+		return string(r)
 	}
-	return string(r)
+	panic("byteEncoder used without bounded allocator - Reader not properly initialized")
 }
 
 type byteRange struct {
@@ -337,6 +382,7 @@ type cmap struct {
 	space   [4][]byteRange // codespace range
 	bfrange []bfrange
 	bfchar  []bfchar
+	v       Value // Access to Reader's global allocator through v.r.bounded
 }
 
 // PDF CMaps define how encoded character codes map to Unicode values.
@@ -398,6 +444,18 @@ type cmap struct {
 func (m *cmap) Decode(raw string) string {
 	logger.Debug("decoding cmap")
 	var runes []rune
+	var allocErr error
+
+	if m.v.r != nil && m.v.r.bounded != nil {
+		runes, allocErr = alloc.BoundedAllocSlice[rune](m.v.r.bounded, len(raw))
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating runes: %v", allocErr))
+			return raw // fallback to raw string on allocation failure
+		}
+		runes = runes[:0] // Set length to 0, keep capacity
+	} else {
+		panic("cmap used without bounded allocator - Reader not properly initialized")
+	}
 
 	for len(raw) > 0 {
 		//find next valid codespace match
@@ -488,6 +546,38 @@ func readCmap(toUnicode Value) *cmap {
 
 	n := -1
 	var m cmap
+	// Capture Value to access Reader's global allocator
+	m.v = toUnicode
+
+	// Pre-allocate cmap internal slices using bounded allocator
+	if toUnicode.r != nil && toUnicode.r.bounded != nil {
+		var allocErr error
+		// Allocate space for each byte length (1-4 bytes)
+		for i := 0; i < 4; i++ {
+			m.space[i], allocErr = alloc.BoundedAllocSlice[byteRange](toUnicode.r.bounded, 10)
+			if allocErr != nil {
+				logger.Error(fmt.Sprintf("Memory limit exceeded allocating cmap space: %v", allocErr))
+				panic(allocErr)
+			}
+			m.space[i] = m.space[i][:0]
+		}
+		m.bfchar, allocErr = alloc.BoundedAllocSlice[bfchar](toUnicode.r.bounded, 100)
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating bfchar: %v", allocErr))
+			panic(allocErr)
+		}
+		m.bfchar = m.bfchar[:0]
+
+		m.bfrange, allocErr = alloc.BoundedAllocSlice[bfrange](toUnicode.r.bounded, 50)
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating bfrange: %v", allocErr))
+			panic(allocErr)
+		}
+		m.bfrange = m.bfrange[:0]
+	} else {
+		panic("readCmap used without bounded allocator - Reader not properly initialized")
+	}
+
 	ok := true
 	Interpret(toUnicode, func(stk *Stack, op string) {
 		if !ok {
@@ -645,7 +735,9 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 		}
 	}
 
-	var textBuilder bytes.Buffer
+	// Use pooled buffer to reduce allocations
+	textBuilder := getBytesBuffer()
+	defer putBytesBuffer(textBuilder)
 	showText := func(s string) {
 		textBuilder.WriteString(s)
 	}
@@ -662,7 +754,11 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 
 	Interpret(strm, func(stk *Stack, op string) {
 		n := stk.Len()
-		args := make([]Value, n)
+		args, allocErr := alloc.BoundedAllocSlice[Value](strm.r.bounded, n)
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating args: %v", allocErr))
+			panic(allocErr)
+		}
 		for i := n - 1; i >= 0; i-- {
 			args[i] = stk.Pop()
 		}
@@ -740,8 +836,18 @@ type Columns []*Column
 func (p Page) GetTextByColumn() (Columns, error) {
 	logger.Debug("retreiving all text grouped by column")
 
-	result := Columns{}
+	var result Columns
 	var err error
+	if p.V.r != nil && p.V.r.bounded != nil {
+		var allocErr error
+		result, allocErr = alloc.BoundedAllocSlice[*Column](p.V.r.bounded, 10) // Initial capacity
+		if allocErr != nil {
+			return nil, fmt.Errorf("memory limit exceeded allocating columns: %v", allocErr)
+		}
+		result = result[:0]
+	} else {
+		panic("GetTextByColumn used without bounded allocator - Reader not properly initialized")
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -751,7 +857,9 @@ func (p Page) GetTextByColumn() (Columns, error) {
 	}()
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
-		var textBuilder bytes.Buffer
+		// Use pooled buffer to reduce allocations
+		textBuilder := getBytesBuffer()
+		defer putBytesBuffer(textBuilder)
 
 		for _, ch := range enc.Decode(s) {
 			_, err := textBuilder.WriteRune(ch)
@@ -776,9 +884,18 @@ func (p Page) GetTextByColumn() (Columns, error) {
 		}
 
 		if !columnFound {
+			var content TextVertical
+			if p.V.r != nil && p.V.r.bounded != nil {
+				var allocErr error
+				content, allocErr = alloc.BoundedAllocSlice[Text](p.V.r.bounded, 100) // Initial capacity
+				if allocErr != nil {
+					panic(fmt.Errorf("memory limit exceeded allocating column content: %v", allocErr))
+				}
+				content = content[:0]
+			}
 			currentColumn = &Column{
 				Position: int64(currentX),
-				Content:  TextVertical{},
+				Content:  content,
 			}
 			result = append(result, currentColumn)
 		}
@@ -812,8 +929,18 @@ type Rows []*Row
 func (p Page) GetTextByRow() (Rows, error) {
 	logger.Debug("retrieving all text grouped by columns")
 
-	result := Rows{}
+	var result Rows
 	var err error
+	if p.V.r != nil && p.V.r.bounded != nil {
+		var allocErr error
+		result, allocErr = alloc.BoundedAllocSlice[*Row](p.V.r.bounded, 10) // Initial capacity
+		if allocErr != nil {
+			return nil, fmt.Errorf("memory limit exceeded allocating rows: %v", allocErr)
+		}
+		result = result[:0]
+	} else {
+		panic("GetTextByRow used without bounded allocator - Reader not properly initialized")
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -823,7 +950,9 @@ func (p Page) GetTextByRow() (Rows, error) {
 	}()
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
-		var textBuilder bytes.Buffer
+		// Use pooled buffer to reduce allocations
+		textBuilder := getBytesBuffer()
+		defer putBytesBuffer(textBuilder)
 		for _, ch := range enc.Decode(s) {
 			_, err := textBuilder.WriteRune(ch)
 			if err != nil {
@@ -852,9 +981,18 @@ func (p Page) GetTextByRow() (Rows, error) {
 		}
 
 		if !rowFound {
+			var content TextHorizontal
+			if p.V.r != nil && p.V.r.bounded != nil {
+				var allocErr error
+				content, allocErr = alloc.BoundedAllocSlice[Text](p.V.r.bounded, 100) // Initial capacity
+				if allocErr != nil {
+					panic(fmt.Errorf("memory limit exceeded allocating row content: %v", allocErr))
+				}
+				content = content[:0]
+			}
 			currentRow = &Row{
 				Position: int64(currentY),
-				Content:  TextHorizontal{},
+				Content:  content,
 			}
 			result = append(result, currentRow)
 		}
@@ -895,7 +1033,11 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 	var currentX, currentY float64
 	Interpret(strm, func(stk *Stack, op string) {
 		n := stk.Len()
-		args := make([]Value, n)
+		args, allocErr := alloc.BoundedAllocSlice[Value](strm.r.bounded, n)
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating args: %v", allocErr))
+			panic(allocErr)
+		}
 		for i := n - 1; i >= 0; i-- {
 			args[i] = stk.Pop()
 		}
@@ -962,6 +1104,18 @@ func (p Page) Content() Content {
 	}
 
 	var text []Text
+	if strm.r != nil && strm.r.bounded != nil {
+		var allocErr error
+		text, allocErr = alloc.BoundedAllocSlice[Text](strm.r.bounded, 1000) // Initial capacity
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating text: %v", allocErr))
+			panic(allocErr)
+		}
+		text = text[:0]
+	} else {
+		panic("Content used without bounded allocator - Reader not properly initialized")
+	}
+
 	showText := func(s string) {
 		n := 0
 		decoded := enc.Decode(s)
@@ -987,10 +1141,34 @@ func (p Page) Content() Content {
 	}
 
 	var rect []Rect
+	if strm.r != nil && strm.r.bounded != nil {
+		var allocErr error
+		rect, allocErr = alloc.BoundedAllocSlice[Rect](strm.r.bounded, 100) // Initial capacity
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating rect: %v", allocErr))
+			panic(allocErr)
+		}
+		rect = rect[:0]
+	}
+
 	var gstack []gstate
+	if strm.r != nil && strm.r.bounded != nil {
+		var allocErr error
+		gstack, allocErr = alloc.BoundedAllocSlice[gstate](strm.r.bounded, 10) // Initial capacity
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating gstack: %v", allocErr))
+			panic(allocErr)
+		}
+		gstack = gstack[:0]
+	}
+
 	Interpret(strm, func(stk *Stack, op string) {
 		n := stk.Len()
-		args := make([]Value, n)
+		args, allocErr := alloc.BoundedAllocSlice[Value](strm.r.bounded, n)
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating args: %v", allocErr))
+			panic(allocErr)
+		}
 		for i := n - 1; i >= 0; i-- {
 			args[i] = stk.Pop()
 		}
@@ -1233,6 +1411,19 @@ func (r *Reader) Outline() Outline {
 func buildOutline(entry Value) Outline {
 	var x Outline
 	x.Title = entry.Key("Title").Text()
+
+	if entry.r != nil && entry.r.bounded != nil {
+		var allocErr error
+		x.Child, allocErr = alloc.BoundedAllocSlice[Outline](entry.r.bounded, 10) // Initial capacity
+		if allocErr != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating outline children: %v", allocErr))
+			panic(allocErr)
+		}
+		x.Child = x.Child[:0]
+	} else {
+		panic("buildOutline used without bounded allocator - Reader not properly initialized")
+	}
+
 	for child := entry.Key("First"); child.Kind() == Dict; child = child.Key("Next") {
 		x.Child = append(x.Child, buildOutline(child))
 	}

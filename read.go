@@ -42,6 +42,7 @@
 // they are implemented only in terms of the Value API and could be moved outside
 // the package. Equally important, traversal of other PDF data structures can be implemented
 // in other packages as needed.
+
 package xtract
 
 // BUG(rsc): The package is incomplete, although it has been used successfully on some
@@ -72,6 +73,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sassoftware/pdf-xtract/alloc"
 	"github.com/sassoftware/pdf-xtract/logger"
 )
 
@@ -87,6 +89,7 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+	bounded    *alloc.BoundedAllocator 
 }
 
 type xref struct {
@@ -96,7 +99,26 @@ type xref struct {
 	offset   int64
 }
 
-func Open(file string) (*os.File, *Reader, error) {
+// OpenWithMemoryLimit opens a PDF file with a memory allocation limit.
+// The limit applies to all parsing operations (xref tables, page content, text extraction, etc.)
+// Returns an error if parsing exceeds the limit.
+//
+// memoryLimit: Maximum bytes that can be allocated during PDF processing.
+//
+// Memory Lifecycle:
+//   - Allocator is created when Reader is initialized
+//   - Memory accumulates during all operations on the Reader
+//   - Processor automatically calls ResetAllocator() after extraction completes
+//
+// Example:
+//
+//	f, r, err := xtract.OpenWithMemoryLimit("large.pdf", 256*1024*1024)
+//	if err != nil {
+//	    return err
+//	}
+//	defer f.Close()
+//	defer r.ResetAllocator() // Release memory when done
+func OpenWithMemoryLimit(file string, memoryLimit int64) (*os.File, *Reader, error) {
 	logger.Debug("Open file", true)
 	f, err := os.Open(file)
 	if err != nil {
@@ -109,7 +131,7 @@ func Open(file string) (*os.File, *Reader, error) {
 		return nil, nil, err
 	}
 	logger.Debug(fmt.Sprintf("document: file:%s -- opened (size=%d)", file, fi.Size()), true)
-	reader, err := NewReader(f, fi.Size())
+	reader, err := NewReaderBounded(f, fi.Size(), memoryLimit)
 	if err != nil {
 		f.Close()
 		return nil, nil, err
@@ -117,8 +139,7 @@ func Open(file string) (*os.File, *Reader, error) {
 	return f, reader, err
 }
 
-// NewReader opens a file for reading, using the data in f with the given total size.
-func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
+func NewReaderBounded(f io.ReaderAt, size int64, memoryLimit int64) (*Reader, error) {
 	logger.Debug("Checking Header", true)
 	if err := CheckHeader(f); err != nil {
 		return nil, err
@@ -134,11 +155,19 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	logger.Debug("Checking xref table + trailer", true)
 
-	r := &Reader{f: f, end: size}
-	b := newBuffer(io.NewSectionReader(r.f, startxref, r.end-startxref), startxref)
+	// Always create bounded allocator
+	if memoryLimit <= 0 {
+		memoryLimit = 32 << 20 // 32MB default for unlimited mode
+		logger.Debug("Creating bounded allocator with high limit (32MB for unlimited mode)", true)
+	} else {
+		logger.Debug(fmt.Sprintf("Creating bounded allocator: limit=%.2f MiB", float64(memoryLimit)/(1024*1024)), true)
+	}
+	bounded := alloc.NewBounded(memoryLimit)
+
+	r := &Reader{f: f, end: size, bounded: bounded}
+	b := r.newBufferWithAlloc(startxref)
 	xref, trailerptr, trailer, err := readXref(r, b)
 	if err != nil {
 		return nil, err
@@ -148,6 +177,14 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 	r.trailerptr = trailerptr
 
 	return r, nil
+}
+
+// newBufferWithAlloc creates
+// a buffer and copies allocator from the reader
+func (r *Reader) newBufferWithAlloc(offset int64) *buffer {
+	b := newBuffer(io.NewSectionReader(r.f, offset, r.end-offset), offset)
+	b.bounded = r.bounded
+	return b
 }
 
 // CheckHeader validates the PDF header at the beginning of the file.
@@ -164,11 +201,12 @@ func CheckHeader(f io.ReaderAt) error {
 		return errors.New("not a PDF file: empty")
 	}
 	buf = buf[:n]
+
 	// Find "%PDF-" possibly not at offset 0 (BOM or garbage before)
 	p := bytes.Index(buf, []byte("%PDF-"))
 	if p < 0 {
 		logger.Error("%PDF possibly not at offset 0 (BOM or garbage before)")
-		return err
+		return errors.New("not a PDF file: %PDF header not found")
 	}
 
 	// Slice from the header token forward
@@ -259,6 +297,33 @@ func (r *Reader) Trailer() Value {
 	return Value{r, r.trailerptr, r.trailer}
 }
 
+// AllocatorStats returns memory allocation statistics for this Reader.
+func (r *Reader) AllocatorStats() alloc.Stats {
+	return r.bounded.Stats()
+}
+
+// AllocatorUsage returns current bytes allocated and the limit for this Reader.
+func (r *Reader) AllocatorUsage() (int64, int64) {
+	return r.bounded.Usage()
+}
+
+// ResetAllocator resets the internal allocator, releasing all parsing memory immediately.
+// This is automatically called by Processor methods (Extract, ExtractAsStream, Metadata)
+// after PDF processing completes.
+//
+// Manual usage: If using Reader directly without Processor, call this when done:
+//
+//	_, r, _ := OpenWithMemoryLimit("file.pdf", 256*1024*1024)
+//	defer r.ResetAllocator()
+//	// ... use r.Page(), r.GetPlainText(), etc.
+//
+// WARNING: This invalidates all previously returned Values, Pages, Text slices, etc.
+// Do not access any parsed data after calling Reset().
+func (r *Reader) ResetAllocator() {
+	r.bounded.Reset()
+	logger.Debug("Bounded allocator reset", true)
+}
+
 func readXref(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	tok := b.readToken()
 	if tok == keyword("xref") {
@@ -274,6 +339,43 @@ func readXref(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	return nil, objptr{}, nil, errors.New(" ")
 }
 
+// estimateXrefCapacity calculates optimal capacity for xref table allocation
+// to minimize dynamic growth during parsing.
+// Uses /Index array for exact calculation when available, otherwise applies
+// safety buffer to declared /Size.
+func estimateXrefCapacity(declaredSize int64, indexArray array) int64 {
+	var capacity int64
+
+	if len(indexArray) > 0 {
+		maxID := int64(0)
+		// /Index format: [start1 count1 start2 count2 ...]
+		for i := 0; i+1 < len(indexArray); i += 2 {
+			if start, ok1 := indexArray[i].(int64); ok1 {
+				if count, ok2 := indexArray[i+1].(int64); ok2 {
+					rangeMax := start + count - 1
+					if rangeMax > maxID {
+						maxID = rangeMax
+					}
+				}
+			}
+		}
+		// a small 5% buffer for safety
+		capacity = maxID + 1 + (maxID+1)/20
+		logger.Debug(fmt.Sprintf("xref capacity from /Index: declared=%d, maxID=%d, capacity=%d", declaredSize, maxID, capacity), true)
+	} else {
+		//Use declared /Size with 20% safety buffer
+		// Handles sparse numbering, incremental updates, and minor corruption
+		capacity = declaredSize * 120 / 100
+		logger.Debug(fmt.Sprintf("xref capacity from /Size: declared=%d, capacity=%d (20%% buffer)", declaredSize, capacity), true)
+	}
+	// Ensure capacity is at least 1 to avoid zero-length slice in case of malformed /Size
+	if capacity <= 0 {
+		capacity = 1
+		logger.Debug(fmt.Sprintf("xref capacity adjusted to minimum: capacity=%d (declaredSize was %d)", capacity, declaredSize), true)
+	}
+	return capacity
+}
+
 func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	logger.Debug("processing Xref Stream")
 	strmptr, strm, err := parseXrefStreamObject(b)
@@ -285,8 +387,30 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	if err != nil {
 		return nil, objptr{}, nil, err
 	}
-	table := make([]xref, size)
-	//Fill entries from the first stream.
+	// Get /Index array for accurate capacity estimation
+	indexArray, _ := strm.hdr["Index"].(array)
+
+	// Estimate optimal capacity to minimize growth during parsing
+	capacity := estimateXrefCapacity(size, indexArray)
+
+	// Convert to int with bounds checking for make()
+	if capacity > int64(int(^uint(0)>>1)) {
+		capacity = int64(int(^uint(0) >> 1)) // Max int value
+	}
+	if capacity < 0 {
+		capacity = int64(size)
+	}
+
+	var table []xref
+	var allocErr error
+
+	table, allocErr = alloc.BoundedAllocSlice[xref](r.bounded, int(capacity))
+	if allocErr != nil {
+		logger.Error(fmt.Sprintf("Memory limit exceeded allocating xref stream table: %v", allocErr))
+		return nil, objptr{}, nil, errors.New("Memory limit exceeded allocating xref stream table")
+	}
+	table = table[:int(size)]
+
 	table, err = readXrefStreamData(r, strm, table, size)
 	if err != nil {
 		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
@@ -296,7 +420,6 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	if err != nil {
 		return nil, objptr{}, nil, err
 	}
-
 	return table, strmptr, strm.hdr, nil
 }
 
@@ -319,7 +442,6 @@ func parseXrefStreamObject(b *buffer) (objptr, stream, error) {
 		logger.Error("malformed PDF: xref stream does not have type XRef")
 		return objptr{}, stream{}, errors.New(" ")
 	}
-
 	return od.ptr, strm, nil
 }
 
@@ -343,7 +465,7 @@ func mergePrevXrefStreams(r *Reader, cur stream, table []xref, maxSize int64) ([
 			return nil, errors.New(" ")
 		}
 		// Open a buffer at the previous xref stream offset and parse it.
-		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
+		b := r.newBufferWithAlloc(off)
 		_, prevStrm, err := parseXrefStreamObject(b)
 		if err != nil {
 			return nil, err
@@ -374,8 +496,9 @@ func mergePrevXrefStreams(r *Reader, cur stream, table []xref, maxSize int64) ([
 	return table, nil
 }
 
-func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xref, error) {
-	// gather filter names (safely)
+// parseXrefStreamMetadata extracts and validates metadata from xref stream header.
+// Returns: index array, W widths, wtotal, totalEntries, data reader, error
+func parseXrefStreamMetadata(r *Reader, strm stream, size int64) (array, []int, int, int, io.ReadCloser, error) {
 	var filters []string
 	if f := strm.hdr["Filter"]; f != nil {
 		switch fv := f.(type) {
@@ -403,14 +526,14 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 	if len(index)%2 != 0 {
 		err := fmt.Errorf("invalid Index array %v", objfmt(index))
 		logger.Error(err.Error())
-		return nil, err
+		return nil, nil, 0, 0, nil, err
 	}
 
 	ww, ok := strm.hdr["W"].(array)
 	if !ok {
 		err := fmt.Errorf("xref stream missing W array")
 		logger.Error(err.Error())
-		return nil, err
+		return nil, nil, 0, 0, nil, err
 	}
 
 	var w []int
@@ -419,14 +542,14 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 		if !ok || int64(int(i)) != i {
 			err := fmt.Errorf("invalid W array %v", objfmt(ww))
 			logger.Error(err.Error())
-			return nil, err
+			return nil, nil, 0, 0, nil, err
 		}
 		w = append(w, int(i))
 	}
 	if len(w) < 3 {
 		err := fmt.Errorf("invalid W array %v", objfmt(ww))
 		logger.Error(err.Error())
-		return nil, err
+		return nil, nil, 0, 0, nil, err
 	}
 
 	v := Value{r, objptr{}, strm}
@@ -434,53 +557,244 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 	for _, wid := range w {
 		wtotal += wid
 	}
-	buf := make([]byte, wtotal)
+
+	// Calculate total entries
+	totalEntries := 0
+	for i := 0; i+1 < len(index); i += 2 {
+		if n, ok := index[i+1].(int64); ok {
+			totalEntries += int(n)
+		}
+	}
+
 	data := v.Reader()
+	return index, w, wtotal, totalEntries, data, nil
+}
+
+// readXrefBatch reads xref stream data into a buffer.
+func readXrefBatch(r *Reader, data io.Reader, batchSize int) ([]byte, error) {
+	batchBuf, err := alloc.BoundedAllocSlice[byte](r.bounded, batchSize)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Memory limit exceeded allocating xref batch: %v", err))
+		return nil, errors.New("Memory limit exceeded allocating xref batch:")
+	}
+	_, err = io.ReadFull(data, batchBuf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		err = fmt.Errorf("error reading xref stream: %v", err)
+		logger.Error(err.Error())
+		return nil, err
+	}
+	return batchBuf, nil
+}
+
+// parseIndexPair extracts and validates a start/count pair from the index array.
+// Returns start, count, remaining index, and error.
+func parseIndexPair(index array) (int64, int64, array, error) {
+	if len(index) < 2 {
+		return 0, 0, nil, fmt.Errorf("index array too short")
+	}
+	start, ok1 := index[0].(int64)
+	n, ok2 := index[1].(int64)
+	if !ok1 || !ok2 {
+		err := fmt.Errorf("malformed Index pair %v %v", objfmt(index[0]), objfmt(index[1]))
+		logger.Error(err.Error())
+		return 0, 0, nil, err
+	}
+	return start, n, index[2:], nil
+}
+
+// extendXrefTable extends the xref table to accommodate maxIdx entries.
+// Uses the provided bounded allocator and returns the possibly-reallocated table.
+func extendXrefTable(bounded *alloc.BoundedAllocator, table []xref, maxIdx int) ([]xref, error) {
+	if maxIdx <= len(table) {
+		return table, nil
+	}
+	
+	if maxIdx > cap(table) {
+		// Allocate with 10% buffer for future growth
+		targetCap := maxIdx * 11 / 10
+		newTable, err := alloc.BoundedAllocSlice[xref](bounded, targetCap)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Memory limit exceeded allocating xref table: %v", err))
+			return nil, errors.New("Memory limit exceeded allocating xref table")
+		}
+		copy(newTable, table)
+		return newTable[:maxIdx], nil
+	}
+	return table[:maxIdx], nil
+}
+
+// decodeXrefEntry decodes a single xref entry from raw bytes.
+// Returns v1 (entry type), v2 (field 2), v3 (field 3).
+func decodeXrefEntry(buf []byte, w0, w1, w2 int) (v1, v2, v3 int) {
+	v1 = 1 // default if w[0] == 0
+	if w0 > 0 {
+		v1 = 0
+		for j := 0; j < w0; j++ {
+			v1 = v1<<8 | int(buf[j])
+		}
+	}
+	v2 = 0
+	for j := 0; j < w1; j++ {
+		v2 = v2<<8 | int(buf[w0+j])
+	}
+	v3 = 0
+	for j := 0; j < w2; j++ {
+		v3 = v3<<8 | int(buf[w0+w1+j])
+	}
+	return
+}
+
+// processXrefChunk processes a chunk of xref data for a single index range.
+func processXrefChunk(table []xref, chunkBuf []byte, start int, count int, w0, w1, w2, wtotal int) ([]xref, error) {
+	bufOffset := 0
+	for i := 0; i < count; i++ {
+		if bufOffset+wtotal > len(chunkBuf) {
+			break
+		}
+		buf := chunkBuf[bufOffset : bufOffset+wtotal]
+		bufOffset += wtotal
+
+		v1, v2, v3 := decodeXrefEntry(buf, w0, w1, w2)
+		x := start + i
+
+		if table[x].ptr != (objptr{}) {
+			continue
+		}
+		switch v1 {
+		case 0:
+			table[x] = xref{ptr: objptr{0, 65535}}
+		case 1:
+			table[x] = xref{ptr: objptr{uint32(x), uint16(v3)}, offset: int64(v2)}
+		case 2:
+			table[x] = xref{ptr: objptr{uint32(x), 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)}
+		}
+	}
+	return table, nil
+}
+
+// parseXrefEntriesFromBatch decodes xref entries from buffer into table.
+func parseXrefEntriesFromBatch(r *Reader, index array, table []xref, batchBuf []byte, w0, w1, w2, wtotal int) ([]xref, error) {
+	bufOffset := 0
+
 	for len(index) > 0 {
-		start, ok1 := index[0].(int64)
-		n, ok2 := index[1].(int64)
-		if !ok1 || !ok2 {
-			err := fmt.Errorf("malformed Index pair %v %v %T %T", objfmt(index[0]), objfmt(index[1]), index[0], index[1])
-			logger.Error(err.Error())
+		start, n, remainingIndex, err := parseIndexPair(index)
+		if err != nil {
 			return nil, err
 		}
-		index = index[2:]
-		for i := 0; i < int(n); i++ {
-			_, err := io.ReadFull(data, buf)
+		index = remainingIndex
+
+		// Pre-extend table once per index range
+		maxIdx := int(start) + int(n)
+		table, err = extendXrefTable(r.bounded, table, maxIdx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Calculate how much data we need for this range
+		rangeBytes := int(n) * wtotal
+		if bufOffset+rangeBytes > len(batchBuf) {
+			rangeBytes = len(batchBuf) - bufOffset
+		}
+
+		// Process this range using the shared helper
+		rangeData := batchBuf[bufOffset : bufOffset+rangeBytes]
+		table, _ = processXrefChunk(table, rangeData, int(start), int(n), w0, w1, w2, wtotal)
+		bufOffset += rangeBytes
+	}
+	return table, nil
+}
+
+func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xref, error) {
+	index, w, wtotal, totalEntries, data, err := parseXrefStreamMetadata(r, strm, size)
+	if err != nil {
+		return nil, err
+	}
+
+	const maxBatchEntries = 1000
+	w0, w1, w2 := w[0], w[1], w[2]
+
+	if totalEntries > maxBatchEntries {
+		return readXrefStreamChunked(r, data, index, table, w0, w1, w2, wtotal)
+	}
+
+	batchSize := wtotal * totalEntries
+	batchBuf, err := readXrefBatch(r, data, batchSize)
+	if err != nil {
+		return nil, err
+	}
+
+	table, err = parseXrefEntriesFromBatch(r, index, table, batchBuf, w0, w1, w2, wtotal)
+	if err != nil {
+		return nil, err
+	}
+
+	if DebugOn {
+		logger.Debug(fmt.Sprintf("parseXrefEntries (entries parsed=%d)", size), true)
+	}
+	return table, nil
+}
+
+// readXrefStreamChunked processes xref stream in chunks to limit memory usage for large PDFs.
+// Instead of loading all entries at once, it processes chunkSize entries at a time.
+func readXrefStreamChunked(r *Reader, data io.Reader, index array, table []xref, w0, w1, w2, wtotal int) ([]xref, error) {
+	const chunkSize = 1024
+
+	if DebugOn {
+		logger.Debug(fmt.Sprintf("Using chunked reading for large xref (chunk=%d entries)", chunkSize), true)
+	}
+
+	for len(index) > 0 {
+		start, n, remainingIndex, err := parseIndexPair(index)
+		if err != nil {
+			return nil, err
+		}
+		index = remainingIndex
+
+		// Pre-extend table once per index range
+		maxIdx := int(start) + int(n)
+		table, err = extendXrefTable(r.bounded, table, maxIdx)
+		if err != nil {
+			return nil, err
+		}
+
+		// Process this index range in chunks
+		remaining := int(n)
+		currentStart := int(start)
+
+		for remaining > 0 {
+			batchCount := remaining
+			if batchCount > chunkSize {
+				batchCount = chunkSize
+			}
+
+			// Read this chunk using bounded allocator
+			chunkBytes := wtotal * batchCount
+			chunkBuf, err := alloc.BoundedAllocSlice[byte](r.bounded, chunkBytes)
 			if err != nil {
-				err = fmt.Errorf("error reading xref stream: %v", err)
+				logger.Error(fmt.Sprintf("Memory limit exceeded allocating xref chunk: %v", err))
+				return nil, err
+			}
+			_, err = io.ReadFull(data, chunkBuf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				err = fmt.Errorf("error reading xref chunk: %v", err)
 				logger.Error(err.Error())
 				return nil, err
 			}
-			v1 := decodeInt(buf[0:w[0]])
-			if w[0] == 0 {
-				v1 = 1
+
+			// Process chunk using shared helper function
+			table, err = processXrefChunk(table, chunkBuf, currentStart, batchCount, w0, w1, w2, wtotal)
+			if err != nil {
+				return nil, err
 			}
-			v2 := decodeInt(buf[w[0] : w[0]+w[1]])
-			v3 := decodeInt(buf[w[0]+w[1] : w[0]+w[1]+w[2]])
-			x := int(start) + i
-			for cap(table) <= x {
-				table = append(table[:cap(table)], xref{})
-			}
-			if table[x].ptr != (objptr{}) {
-				continue
-			}
-			switch v1 {
-			case 0:
-				table[x] = xref{ptr: objptr{0, 65535}}
-			case 1:
-				table[x] = xref{ptr: objptr{uint32(x), uint16(v3)}, offset: int64(v2)}
-			case 2:
-				table[x] = xref{ptr: objptr{uint32(x), 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)}
-			default:
-				if DebugOn {
-					logger.Error(fmt.Sprintf("invalid xref stream type %d: %x", v1, buf))
-				}
-			}
+
+			remaining -= batchCount
+			currentStart += batchCount
 		}
 	}
-	logger.Debug(fmt.Sprintf("parseXrefEntries (entries parsed=%d)", size), true)
 
+	if DebugOn {
+		logger.Debug("Chunked xref reading completed", true)
+	}
 	return table, nil
 }
 
@@ -494,7 +808,21 @@ func decodeInt(b []byte) int {
 
 func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	logger.Debug("processing xref table")
-	table, trailer, err := parseXrefTableAndTrailer(b, nil)
+
+	initialCapacity := 2000
+	var initialTable []xref
+	var err error
+
+	initialTable, err = alloc.BoundedAllocSlice[xref](r.bounded, initialCapacity)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Memory limit exceeded allocating initial xref table: %v", err))
+		return nil, objptr{}, nil, err
+	}
+	initialTable = initialTable[:0] // Set length to 0, keep capacity
+
+	logger.Debug(fmt.Sprintf("xref table: preallocated capacity=%d", initialCapacity), true)
+
+	table, trailer, err := parseXrefTableAndTrailer(b, initialTable)
 	if err != nil {
 		return nil, objptr{}, nil, err
 	}
@@ -502,8 +830,10 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	// This will parse the xref stream pointed to by the trailer and merge its entries.
 	table, trailer, err = r.handleTrailerXRefStm(table, trailer)
 	if err != nil {
+		if errors.Is(err, alloc.ErrMemoryLimitExceeded) {
+			return nil, objptr{}, nil, err
+		}
 		logger.Error("readXrefTable: XRefStm handling error: %v. Falling back to Prev chain.", err)
-		// proceed with Prev chain to salvage what we can from ASCII tables.
 	}
 
 	// Follow the Prev chain if present
@@ -516,7 +846,6 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
 	if err := validateTrailerSize(&table, trailer); err != nil {
 		return nil, objptr{}, nil, err
 	}
-
 	return table, objptr{}, trailer, nil
 
 }
@@ -547,7 +876,7 @@ func resolvePrevXrefTables(r *Reader, trailer dict, table []xref) ([]xref, dict,
 			logger.Error(fmt.Sprintf("malformed PDF: xref Prev is not integer: %v", prevoff))
 			return nil, nil, errors.New(" ")
 		}
-		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
+		b := r.newBufferWithAlloc(off)
 		// Prev must start with "xref"
 		tok := b.readToken()
 		if tok != keyword("xref") {
@@ -563,6 +892,9 @@ func resolvePrevXrefTables(r *Reader, trailer dict, table []xref) ([]xref, dict,
 		// call handleTrailerXRefStm for this older trailer before walking further Prev
 		table, trailer, err = r.handleTrailerXRefStm(table, trailer)
 		if err != nil {
+			if errors.Is(err, alloc.ErrMemoryLimitExceeded) {
+				return nil, nil, err
+			}
 			logger.Debug("warning: XRefStm handling error in Prev chain: %v; continuing\n", err)
 			// continue even if XRefStm handling failed for this prev trailer
 		}
@@ -588,31 +920,41 @@ func validateTrailerSize(table *[]xref, trailer dict) error {
 
 // ensureLen makes sure s has length at least n (growing capacity if needed)
 // and returns the possibly-reallocated slice.
-func ensureLen[T any](s []T, n int) []T {
+func ensureLen[T any](s []T, n int, bounded *alloc.BoundedAllocator) ([]T, error) {
 	if n <= len(s) {
-		return s
+		return s, nil
 	}
 	if cap(s) < n {
-		ns := make([]T, n)
+		ns, err := alloc.BoundedAllocSlice[T](bounded, n)
+		if err != nil {
+			return s, err
+		}
 		copy(ns, s)
-		return ns
+		return ns, nil
 	}
-	return s[:n]
+	return s[:n], nil
 }
 
 // setIfEmpty sets table[x] to val only if the slot is currently empty.
-func setIfEmpty(table *[]xref, x int, val xref) {
+func setIfEmpty(table *[]xref, x int, val xref, bounded *alloc.BoundedAllocator) error {
 	if x < 0 {
-		return
+		return nil
 	}
-	*table = ensureLen(*table, x+1)
+	newTable, err := ensureLen(*table, x+1, bounded)
+	if err != nil {
+		return err
+	}
+	*table = newTable
 	if (*table)[x].ptr == (objptr{}) {
 		(*table)[x] = val
 	}
+	return nil
 }
 
 func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
-	logger.Debug("reading xref table data")
+	if DebugOn {
+		logger.Debug("reading xref table data")
+	}
 	for {
 		tok := b.readToken()
 		if tok == keyword("trailer") {
@@ -624,6 +966,15 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 			logger.Error("malformed xref table subsection header")
 			return nil, errors.New(" ")
 		}
+
+		// Pre-extend table once before loop to avoid repeated growth checks
+		maxIdx := int(start) + int(count)
+		var err error
+		table, err = extendXrefTable(b.bounded, table, maxIdx)
+		if err != nil {
+			return nil, err
+		}
+
 		for i := 0; i < int(count); i++ {
 			offTok := b.readToken()
 			genTok := b.readToken()
@@ -640,13 +991,22 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 			idx := int(start) + i
 			switch alloc {
 			case keyword("n"): // in-use — record if empty
-				setIfEmpty(&table, idx, xref{ptr: objptr{uint32(idx), uint16(gen)}, offset: off})
+				if err := setIfEmpty(&table, idx, xref{ptr: objptr{uint32(idx), uint16(gen)}, offset: off}, b.bounded); err != nil {
+					logger.Error(fmt.Sprintf("Memory limit exceeded in setIfEmpty: %v", err))
+					return nil, errors.New("Memory limit exceeded in setIfEmpty")
+				}
 			case keyword("f"): // free — ensure slice long enough for safe indexing
-				table = ensureLen(table, idx+1)
+				var err error
+				table, err = ensureLen(table, idx+1, b.bounded)
+				if err != nil {
+					logger.Error(fmt.Sprintf("Memory limit exceeded in ensureLen: %v", err))
+					return nil, errors.New("Memory limit exceeded in ensureLen")
+				}
 			default:
 				logger.Error(fmt.Sprintf("malformed xref table: unexpected alloc token %v", alloc))
 				return nil, errors.New(" ")
 			}
+			// 'f' entries: table already extended, nothing to do
 		}
 	}
 	return table, nil
@@ -657,11 +1017,27 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 // - if dest empty => accept src
 // - if dest free (gen==65535) and src in-use => replace
 // - if both in-use => prefer src (stream authoritative)
-func mergeXrefTables(dest []xref, src []xref) []xref {
+// Optimized to reuse existing capacity when possible.
+func (r *Reader) mergeXrefTables(dest []xref, src []xref) []xref {
 	if len(src) > len(dest) {
-		nd := make([]xref, len(src))
-		copy(nd, dest)
-		dest = nd
+		// Check if we can reuse existing capacity
+		if cap(dest) >= len(src) {
+			// Just extend length - no allocation needed
+			dest = dest[:len(src)]
+			logger.Debug(fmt.Sprintf("merge: reused capacity, extended to len=%d", len(src)), true)
+		} else {
+			// Need to allocate - add 10% buffer for future merges
+			newCap := len(src) * 11 / 10
+			nd, err := alloc.BoundedAllocSlice[xref](r.bounded, newCap)
+			if err != nil {
+				logger.Error(fmt.Sprintf("Memory limit exceeded in mergeXrefTables: %v", err))
+				return dest // Return original on allocation failure
+			}
+			nd = nd[:len(src)]
+			copy(nd, dest)
+			dest = nd
+			logger.Debug(fmt.Sprintf("merge: reallocated from cap=%d to cap=%d", cap(dest), newCap), true)
+		}
 	}
 	for i := 0; i < len(src); i++ {
 		s := src[i]
@@ -688,8 +1064,9 @@ func (r *Reader) isLikelyObjectAt(off int64) bool {
 	if off < 0 || off >= r.end {
 		return false
 	}
-	buf := make([]byte, 64)
-	n, err := r.f.ReadAt(buf, off)
+	// Stack allocation - zero GC cost for fixed-size buffer
+	var buf [64]byte
+	n, err := r.f.ReadAt(buf[:], off)
 	if err != nil && err != io.EOF {
 		return false
 	}
@@ -729,6 +1106,7 @@ func (r *Reader) scanForObjectAt(id uint32, gen uint16, approx int64, window int
 	if size <= 0 {
 		return -1
 	}
+	// Scoped allocation - buffer lifetime tied to function scope
 	buf := make([]byte, size)
 	n, err := r.f.ReadAt(buf, start)
 	if err != nil && err != io.EOF {
@@ -786,7 +1164,7 @@ func (r *Reader) handleTrailerXRefStm(table []xref, trailer dict) ([]xref, dict,
 		logger.Error(fmt.Sprintf("malformed PDF: XRefStm not integer: %v", xrefstm))
 		return table, trailer, errors.New(" ")
 	}
-	b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
+	b := r.newBufferWithAlloc(off)
 	srcTable, _, hdr, err := readXrefStream(r, b)
 	if err != nil {
 		logger.Error(fmt.Sprintf("failed to parse XRefStm at %d: %v", off, err))
@@ -809,7 +1187,7 @@ func (r *Reader) handleTrailerXRefStm(table []xref, trailer dict) ([]xref, dict,
 	}
 
 	// Merge the stream table into the main ASCII table.
-	table = mergeXrefTables(table, srcTable)
+	table = r.mergeXrefTables(table, srcTable)
 
 	if _, ok := hdr["Size"]; !ok {
 		logger.Debug(fmt.Sprintf("xref stream at %d missing /Size", off))
@@ -1005,7 +1383,8 @@ func objfmt(x interface{}) string {
 			keys = append(keys, string(k))
 		}
 		sort.Strings(keys)
-		var buf bytes.Buffer
+		buf := getBytesBuffer()
+		defer putBytesBuffer(buf)
 		buf.WriteString("<<")
 		for i, k := range keys {
 			elem := x[name(k)]
@@ -1021,7 +1400,8 @@ func objfmt(x interface{}) string {
 		return buf.String()
 
 	case array:
-		var buf bytes.Buffer
+		buf := getBytesBuffer()
+		defer putBytesBuffer(buf)
 		buf.WriteString("[")
 		for i, elem := range x {
 			if i > 0 {
@@ -1241,7 +1621,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				strm = ext
 			}
 		} else {
-			b := newBuffer(io.NewSectionReader(r.f, xref.offset, r.end-xref.offset), xref.offset)
+			b := r.newBufferWithAlloc(xref.offset)
 			b.key = r.key
 			b.useAES = r.useAES
 			obj = b.readObject()
@@ -1300,7 +1680,6 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		}
 		parent = ptr
 	}
-
 	switch x := x.(type) {
 	case nil, bool, int64, float64, name, dict, array, stream:
 		return Value{r, parent, x}
@@ -1427,4 +1806,3 @@ func (r *pngUpReader) Read(b []byte) (int, error) {
 	}
 	return n, nil
 }
-

@@ -24,8 +24,12 @@ type Config struct {
 	ParsingMode       ParsingMode   `validate:"oneof=strict best-effort"`
 	MaxRetries        int           `validate:"min=0,max=3"`
 	MaxTotalChars     int           `validate:"min=0"`
-	DebugOn           bool
-	Logger            logger.LogFunc
+	// MaxMemoryPerPDF sets a hard memory limit per PDF document using the bounded allocator.
+	// Set to 0 for unlimited memory (backward compatible).
+	// Total system memory = MaxConcurrentPDFs × MaxMemoryPerPDF
+	MaxMemoryPerPDF int64 `validate:"min=0"`
+	DebugOn         bool
+	Logger          logger.LogFunc
 	// Metrics           MetricsInterface
 }
 
@@ -37,6 +41,7 @@ func NewDefaultConfig() *Config {
 		ParsingMode:       BestEffort,
 		MaxRetries:        3,
 		MaxTotalChars:     0,
+		MaxMemoryPerPDF:   10 << 20,
 		DebugOn:           false,
 	}
 }
