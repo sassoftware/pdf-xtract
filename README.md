@@ -114,7 +114,7 @@ fmt.Println("Final concatenated length:", len(total))
 ```
 #### Metadata Extraction
 ```golang
-// Print metadata as pretty JSON to stdout
+// Print metadata as JSON
 err := proc.Metadata(ctx, "yourfile.pdf", os.Stdout)
 if err != nil {
 	fmt.Println("Failed to extract metadata:", err)
