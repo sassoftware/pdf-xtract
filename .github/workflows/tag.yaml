@@ -34,7 +34,7 @@ jobs:
 
       - name: Calculate version and tag
         run: |
-          VERSION="$(gotagger)"
+          VERSION="$(gotagger -modules=false)"
           echo "Calculated version: ${VERSION}"
 
           if git rev-parse "${VERSION}" >/dev/null 2>&1; then
