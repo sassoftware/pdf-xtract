@@ -80,7 +80,7 @@ import (
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
 var DebugOn = false
 
-// A Reader is a single PDF file open for reading.
+// A Reader is a single PDF file open for reading
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
